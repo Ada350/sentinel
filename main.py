@@ -10,13 +10,7 @@ from datetime import datetime
 from requests.exceptions import RequestException, HTTPError, Timeout, ConnectionError
 
 try:
-    from        # Fetch data from each endpoint
-        for name, config in selected_endpoints.items():
-            logger.info(f"Processing {name}...")
-            alt_endpoints = config.get("alt_endpoints", None)
-            data = fetch_with_retry(config["endpoint"], config["params"], alt_endpoints)
-            collection_status[name] = len(data) > 0
-            dataframes[name] = create_dataframe(data, name)v import load_dotenv
+    from dotenv import load_dotenv
     # Load environment variables from .env file if it exists
     load_dotenv()
 except ImportError:
