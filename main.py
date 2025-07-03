@@ -40,6 +40,13 @@ API_TOKEN = os.getenv("API_TOKEN") or os.getenv("SENTINEL_API_TOKEN")
 if API_TOKEN:
     # Strip any whitespace or newline characters that might be in the token
     API_TOKEN = API_TOKEN.strip()
+else:
+    # If no token provided, we could try to generate one using the API
+    # POST https://your_management_url/web/api/v2.0/users/generate-api-token
+    # This would require username/password authentication which is not recommended for automation
+    # Instead, we'll just exit with an error
+    print("❌ Error: API_TOKEN or SENTINEL_API_TOKEN environment variable is required")
+    sys.exit(1)
 
 # Get output dir and log level
 OUTPUT_DIR = args.output or os.getenv("OUTPUT_DIR", "data_output")
@@ -49,7 +56,15 @@ LOG_LEVEL = args.log_level or os.getenv("LOG_LEVEL", "INFO")
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 TIMEOUT = 30  # seconds
-REQUEST_DELAY = 0.5  # seconds
+REQUEST_DELAY = 1  # seconds - increased to help avoid rate limits
+# Add rate limiting to comply with API documentation
+RATE_LIMITS = {
+    "agents": 25,  # 25 calls per second
+    "threats": 25,  # 25 calls per second
+    "cloud-detection/rules": 0.5,  # 30 calls per minute
+    "threat-intelligence": 0.08,  # 5 calls per minute
+    "default": 1  # 1 call per second for others
+}
 
 if not API_TOKEN:
     print("❌ Error: API_TOKEN or SENTINEL_API_TOKEN environment variable is required")
@@ -89,12 +104,28 @@ if not BASE_URL:
     
     # If any endpoints fail with 404, we might want to try a different API version
     # This is done by providing alternate endpoints, but we can also set up a fallback URL
-    fallback_versions = ["v2.0", "v2.1"]
+    # Prioritize newer versions first, then try older ones
+    fallback_versions = ["v2.1", "v2.0", "v2"]
     if api_version in fallback_versions:
         fallback_versions.remove(api_version)
     FALLBACK_URLS = [f"https://{region}.sentinelone.net/web/api/{v}" for v in fallback_versions]
     if FALLBACK_URLS:
         logger.info(f"Configured fallback API URLs if needed: {FALLBACK_URLS}")
+    
+    # Try to discover available API versions
+    try:
+        logger.info("Attempting to discover available API versions...")
+        # Try to hit the base API without a version to see if it returns info
+        discovery_url = f"https://{region}.sentinelone.net/web/api"
+        discovery_response = requests.get(f"{discovery_url}/version", headers=HEADERS, timeout=TIMEOUT)
+        if discovery_response.status_code == 200:
+            version_info = discovery_response.json()
+            logger.info(f"API version discovery successful: {version_info}")
+            # Could parse this to update FALLBACK_URLS if needed
+        else:
+            logger.warning(f"API version discovery failed with status {discovery_response.status_code}")
+    except Exception as e:
+        logger.warning(f"Error during API version discovery: {e}")
 else:
     logger.info(f"Using configured BASE_URL: {BASE_URL}")
     FALLBACK_URLS = []
@@ -102,83 +133,196 @@ else:
 # === API ENDPOINTS ===
 # Dictionary of endpoints to fetch
 ENDPOINTS = {
-    "sites": {"endpoint": "/sites", "params": None},
-    "policies": {"endpoint": "/policies", "params": None, "alt_endpoints": ["/endpoint-policies", "/policy"]},
-    "exclusions": {"endpoint": "/exclusions", "params": None},
-    "deployments": {"endpoint": "/deployment-packs", "params": None, "alt_endpoints": ["/install-packages", "/installer-packages", "/packages"]},
-    "agents": {"endpoint": "/agents", "params": {"limit": 1000}},
-    "rules": {"endpoint": "/rules", "params": None, "alt_endpoints": ["/firewall/rules", "/network/rules", "/firewall-rules"]},
-    "alerts": {"endpoint": "/alerts", "params": {"limit": 100}, "alt_endpoints": ["/threats", "/activities"]},
-    "api_tokens": {"endpoint": "/api-tokens", "params": None, "alt_endpoints": ["/users/api-token-details", "/system/api-tokens", "/rbac/api-tokens"]}
+    "sites": {"endpoint": "/sites", "params": {"limit": 100}, "paginate": True},
+    "policies": {"endpoint": "/policies", "params": {"limit": 100}, "alt_endpoints": ["/endpoint-policies", "/policy", "/settings/policies"], "paginate": True},
+    "exclusions": {"endpoint": "/exclusions", "params": {"limit": 100}, "paginate": True},
+    "deployments": {"endpoint": "/deployment-packs", "params": {"limit": 100}, "alt_endpoints": ["/install-packages", "/installer-packages", "/packages", "/sentinels/installer"], "paginate": True},
+    "agents": {"endpoint": "/agents", "params": {"limit": 100}, "alt_endpoints": ["/sentinels"], "paginate": True, "rate_limit": 25},
+    "rules": {"endpoint": "/rules", "params": {"limit": 100}, "alt_endpoints": ["/firewall/rules", "/network/rules", "/firewall-rules", "/settings/rules"], "paginate": True},
+    "alerts": {"endpoint": "/alerts", "params": {"limit": 100}, "alt_endpoints": ["/threats", "/activities", "/detections"], "paginate": True, "rate_limit": 25},
+    "api_tokens": {"endpoint": "/users/api-token-details", "params": None, "alt_endpoints": ["/api-tokens", "/system/api-tokens", "/rbac/api-tokens", "/settings/user/tokens"], "paginate": False}
 }
 
 # === HELPER FUNCTIONS ===
-def fetch_with_retry(endpoint, params=None, alt_endpoints=None):
-    """Fetch data from API with retry logic"""
+def fetch_with_retry(endpoint, params=None, alt_endpoints=None, paginate=False, rate_limit=None):
+    """Fetch data from API with retry logic and pagination support"""
+    # Determine rate limit for this endpoint
+    if rate_limit is None:
+        # Check if any part of the endpoint matches a key in RATE_LIMITS
+        for key, limit in RATE_LIMITS.items():
+            if key in endpoint:
+                rate_limit = limit
+                break
+        # If no match, use default
+        if rate_limit is None:
+            rate_limit = RATE_LIMITS.get("default", 1)
+    
+    # Calculate sleep time based on rate limit (in seconds)
+    sleep_time = 1.0 / rate_limit if rate_limit > 0 else 1
+    logger.debug(f"Using rate limit of {rate_limit} requests/second (sleep time: {sleep_time:.3f}s)")
+    
     # Try primary endpoint first
     url = f"{BASE_URL}{endpoint}"
     attempts = 0
     primary_failed = False
+    all_data = []
     
-    while attempts < MAX_RETRIES:
-        try:
-            logger.info(f"Fetching data from {endpoint}")
+    # For pagination
+    next_cursor = None
+    page_count = 0
+    max_pages = 100  # Safety limit
+    
+    # If paginating, we'll loop until no more pages
+    while True:
+        if page_count >= max_pages:
+            logger.warning(f"Reached maximum page count ({max_pages}) for {endpoint}. Some data may be missing.")
+            break
             
-            # Add delay to prevent rate limiting
-            if attempts > 0:
-                time.sleep(REQUEST_DELAY)
+        page_count += 1
+        current_params = params.copy() if params else {}
+        
+        # Add cursor if we're paginating and have a next cursor
+        if paginate and next_cursor:
+            current_params['cursor'] = next_cursor
+            
+        attempts = 0
+        while attempts < MAX_RETRIES:
+            try:
+                if page_count == 1:
+                    logger.info(f"Fetching data from {endpoint}")
+                else:
+                    logger.info(f"Fetching page {page_count} from {endpoint}")
                 
-            response = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
-            response.raise_for_status()
-            data = response.json().get("data", [])
-            logger.info(f"Successfully fetched {len(data)} records from {endpoint}")
-            return data
-            
-        except HTTPError as http_err:
-            logger.error(f"HTTP error occurred when calling {endpoint}: {http_err}")
-            if response.status_code == 401:
-                logger.error("Authentication failed. Check your API token.")
-                return []  # No point retrying auth failures
-            elif response.status_code == 403:
-                logger.error("Permission denied. Your API token may not have sufficient privileges.")
-                return []  # No point retrying permission issues
-            elif response.status_code == 429:
-                logger.error("Rate limit exceeded. Retrying after delay.")
-                # Continue to retry logic for rate limits
-            elif response.status_code == 404 and alt_endpoints and attempts == MAX_RETRIES - 1:
-                # If primary endpoint is 404 and we've tried enough times, mark it as failed
-                # We'll try alternate endpoints after
-                primary_failed = True
-                logger.warning(f"Endpoint {endpoint} not found (404). Will try alternate endpoints.")
+                # Add delay to prevent rate limiting
+                if attempts > 0 or page_count > 1:
+                    time.sleep(max(sleep_time, REQUEST_DELAY))
+                    
+                response = requests.get(url, headers=HEADERS, params=current_params, timeout=TIMEOUT)
+                response.raise_for_status()
+                
+                response_data = response.json()
+                data = response_data.get("data", [])
+                all_data.extend(data)
+                
+                if page_count == 1:
+                    logger.info(f"Successfully fetched {len(data)} records from {endpoint}")
+                else:
+                    logger.info(f"Successfully fetched {len(data)} records from {endpoint} (page {page_count})")
+                
+                # Check for pagination info
+                if paginate:
+                    pagination = response_data.get("pagination", {})
+                    next_cursor = pagination.get("nextCursor")
+                    total_items = pagination.get("totalItems", 0)
+                    
+                    if next_cursor:
+                        logger.debug(f"Found next cursor for {endpoint}, continuing pagination")
+                    else:
+                        logger.debug(f"No more pages for {endpoint}")
+                        break
+                else:
+                    # Not paginating, we're done
+                    break
+                    
+                # Break out of retry loop
                 break
+                
+            except HTTPError as http_err:
+                logger.error(f"HTTP error occurred when calling {endpoint}: {http_err}")
+                if response.status_code == 401:
+                    logger.error("Authentication failed. Check your API token.")
+                    return []  # No point retrying auth failures
+                elif response.status_code == 403:
+                    logger.error("Permission denied. Your API token may not have sufficient privileges.")
+                    return []  # No point retrying permission issues
+                elif response.status_code == 429:
+                    logger.error("Rate limit exceeded. Retrying after longer delay.")
+                    sleep_time *= 2  # Double the sleep time
+                elif response.status_code == 404 and alt_endpoints and attempts == MAX_RETRIES - 1 and page_count == 1:
+                    # If primary endpoint is 404 and we've tried enough times, mark it as failed
+                    # We'll try alternate endpoints after
+                    primary_failed = True
+                    logger.warning(f"Endpoint {endpoint} not found (404). Will try alternate endpoints.")
+                    break
+                else:
+                    logger.error(f"HTTP error {response.status_code}. Retrying...")
+            except (ConnectionError, Timeout) as err:
+                logger.error(f"Connection error when calling {endpoint}: {err}")
+            except Exception as e:
+                logger.error(f"Unexpected error occurred when calling {endpoint}: {e}")
+                return all_data  # Don't retry unexpected errors
+                
+            # Exponential backoff
+            attempts += 1
+            if attempts < MAX_RETRIES:
+                wait_time = RETRY_DELAY * (2 ** (attempts - 1))
+                logger.warning(f"Attempt {attempts} failed. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                logger.error(f"HTTP error {response.status_code}. Retrying...")
-        except (ConnectionError, Timeout) as err:
-            logger.error(f"Connection error when calling {endpoint}: {err}")
-        except Exception as e:
-            logger.error(f"Unexpected error occurred when calling {endpoint}: {e}")
-            return []  # Don't retry unexpected errors
-            
-        # Exponential backoff
-        attempts += 1
-        if attempts < MAX_RETRIES:
-            wait_time = RETRY_DELAY * (2 ** (attempts - 1))
-            logger.warning(f"Attempt {attempts} failed. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-        else:
-            logger.error(f"All {MAX_RETRIES} attempts failed for {endpoint}")
+                logger.error(f"All {MAX_RETRIES} attempts failed for {endpoint}")
+                
+        # If we're not paginating or there are no more pages, exit the pagination loop
+        if not paginate or not next_cursor or primary_failed:
+            break
     
+    # If we got some data already, return it
+    if all_data:
+        return all_data
+        
     # If primary endpoint failed with 404 and we have alternates, try those
     if primary_failed and alt_endpoints:
         for alt_endpoint in alt_endpoints:
             logger.info(f"Trying alternate endpoint: {alt_endpoint}")
             alt_url = f"{BASE_URL}{alt_endpoint}"
             try:
-                response = requests.get(alt_url, headers=HEADERS, params=params, timeout=TIMEOUT)
-                response.raise_for_status()
-                data = response.json().get("data", [])
-                logger.info(f"Successfully fetched {len(data)} records from alternate endpoint {alt_endpoint}")
-                return data
+                # Use the same pagination approach for alternate endpoints
+                alt_all_data = []
+                alt_next_cursor = None
+                alt_page_count = 0
+                
+                while True:
+                    if alt_page_count >= max_pages:
+                        logger.warning(f"Reached maximum page count ({max_pages}) for {alt_endpoint}. Some data may be missing.")
+                        break
+                        
+                    alt_page_count += 1
+                    alt_current_params = params.copy() if params else {}
+                    
+                    # Add cursor if we're paginating and have a next cursor
+                    if paginate and alt_next_cursor:
+                        alt_current_params['cursor'] = alt_next_cursor
+                
+                    # Apply rate limiting
+                    if alt_page_count > 1:
+                        time.sleep(sleep_time)
+                
+                    response = requests.get(alt_url, headers=HEADERS, params=alt_current_params, timeout=TIMEOUT)
+                    response.raise_for_status()
+                    
+                    response_data = response.json()
+                    data = response_data.get("data", [])
+                    alt_all_data.extend(data)
+                    
+                    if alt_page_count == 1:
+                        logger.info(f"Successfully fetched {len(data)} records from alternate endpoint {alt_endpoint}")
+                    else:
+                        logger.info(f"Successfully fetched {len(data)} records from alternate endpoint {alt_endpoint} (page {alt_page_count})")
+                    
+                    # Check for pagination info
+                    if paginate:
+                        pagination = response_data.get("pagination", {})
+                        alt_next_cursor = pagination.get("nextCursor")
+                        
+                        if alt_next_cursor:
+                            logger.debug(f"Found next cursor for {alt_endpoint}, continuing pagination")
+                        else:
+                            logger.debug(f"No more pages for {alt_endpoint}")
+                            break
+                    else:
+                        # Not paginating, we're done
+                        break
+                
+                return alt_all_data
             except Exception as e:
                 logger.warning(f"Alternate endpoint {alt_endpoint} also failed: {e}")
                 continue
@@ -190,11 +334,54 @@ def fetch_with_retry(endpoint, params=None, alt_endpoints=None):
             fallback_full_url = f"{fallback_url}{endpoint}"
             logger.info(f"Trying fallback URL: {fallback_full_url}")
             try:
-                response = requests.get(fallback_full_url, headers=HEADERS, params=params, timeout=TIMEOUT)
-                response.raise_for_status()
-                data = response.json().get("data", [])
-                logger.info(f"Successfully fetched {len(data)} records from fallback URL {fallback_full_url}")
-                return data
+                # Use the same pagination approach for fallback URLs
+                fallback_all_data = []
+                fallback_next_cursor = None
+                fallback_page_count = 0
+                
+                while True:
+                    if fallback_page_count >= max_pages:
+                        logger.warning(f"Reached maximum page count ({max_pages}) for {fallback_full_url}. Some data may be missing.")
+                        break
+                        
+                    fallback_page_count += 1
+                    fallback_current_params = params.copy() if params else {}
+                    
+                    # Add cursor if we're paginating and have a next cursor
+                    if paginate and fallback_next_cursor:
+                        fallback_current_params['cursor'] = fallback_next_cursor
+                
+                    # Apply rate limiting
+                    if fallback_page_count > 1:
+                        time.sleep(sleep_time)
+                
+                    response = requests.get(fallback_full_url, headers=HEADERS, params=fallback_current_params, timeout=TIMEOUT)
+                    response.raise_for_status()
+                    
+                    response_data = response.json()
+                    data = response_data.get("data", [])
+                    fallback_all_data.extend(data)
+                    
+                    if fallback_page_count == 1:
+                        logger.info(f"Successfully fetched {len(data)} records from fallback URL {fallback_full_url}")
+                    else:
+                        logger.info(f"Successfully fetched {len(data)} records from fallback URL {fallback_full_url} (page {fallback_page_count})")
+                    
+                    # Check for pagination info
+                    if paginate:
+                        pagination = response_data.get("pagination", {})
+                        fallback_next_cursor = pagination.get("nextCursor")
+                        
+                        if fallback_next_cursor:
+                            logger.debug(f"Found next cursor for {fallback_full_url}, continuing pagination")
+                        else:
+                            logger.debug(f"No more pages for {fallback_full_url}")
+                            break
+                    else:
+                        # Not paginating, we're done
+                        break
+                
+                return fallback_all_data
             except Exception as e:
                 logger.warning(f"Fallback URL {fallback_full_url} also failed: {e}")
                 continue
@@ -259,9 +446,6 @@ def create_dataframe(data, name):
                     logger.warning(f"Normalization failed for {name}: {norm_e}. Trying simple approach.")
                     # If normalization fails, try simple approach
                     if isinstance(data, list) and all(isinstance(item, str) for item in data):
-                        df = pd.DataFrame({"name": data})
-                        logger.info(f"Created simple DataFrame for {name} with {len(df)} rows")
-                        return df
                         df = pd.DataFrame({"name": data})
                         logger.info(f"Created simple DataFrame for {name} with {len(df)} rows")
                         return df
@@ -338,7 +522,15 @@ def main():
         # Fetch data from each endpoint
         for name, config in selected_endpoints.items():
             logger.info(f"Processing {name}...")
-            data = fetch_with_retry(config["endpoint"], config["params"], config.get("alt_endpoints"))
+            paginate = config.get("paginate", False)
+            rate_limit = config.get("rate_limit", None)
+            data = fetch_with_retry(
+                config["endpoint"], 
+                config["params"], 
+                config.get("alt_endpoints"),
+                paginate=paginate,
+                rate_limit=rate_limit
+            )
             collection_status[name] = len(data) > 0
             dataframes[name] = create_dataframe(data, name)
         
