@@ -86,18 +86,30 @@ if not BASE_URL:
     api_version = os.getenv("API_VERSION", "v2.1")
     BASE_URL = f"https://{region}.sentinelone.net/web/api/{api_version}"
     logger.info(f"Using auto-configured BASE_URL: {BASE_URL}")
+    
+    # If any endpoints fail with 404, we might want to try a different API version
+    # This is done by providing alternate endpoints, but we can also set up a fallback URL
+    fallback_versions = ["v2.0", "v2.1"]
+    if api_version in fallback_versions:
+        fallback_versions.remove(api_version)
+    FALLBACK_URLS = [f"https://{region}.sentinelone.net/web/api/{v}" for v in fallback_versions]
+    if FALLBACK_URLS:
+        logger.info(f"Configured fallback API URLs if needed: {FALLBACK_URLS}")
+else:
+    logger.info(f"Using configured BASE_URL: {BASE_URL}")
+    FALLBACK_URLS = []
 
 # === API ENDPOINTS ===
 # Dictionary of endpoints to fetch
 ENDPOINTS = {
     "sites": {"endpoint": "/sites", "params": None},
-    "policies": {"endpoint": "/policies", "params": None, "alt_endpoints": ["/endpoint-policies"]},
+    "policies": {"endpoint": "/policies", "params": None, "alt_endpoints": ["/endpoint-policies", "/policy"]},
     "exclusions": {"endpoint": "/exclusions", "params": None},
-    "deployments": {"endpoint": "/deployment-packs", "params": None, "alt_endpoints": ["/install-packages", "/installer-packages"]},
+    "deployments": {"endpoint": "/deployment-packs", "params": None, "alt_endpoints": ["/install-packages", "/installer-packages", "/packages"]},
     "agents": {"endpoint": "/agents", "params": {"limit": 1000}},
-    "rules": {"endpoint": "/rules", "params": None, "alt_endpoints": ["/firewall/rules", "/network/rules"]},
+    "rules": {"endpoint": "/rules", "params": None, "alt_endpoints": ["/firewall/rules", "/network/rules", "/firewall-rules"]},
     "alerts": {"endpoint": "/alerts", "params": {"limit": 100}, "alt_endpoints": ["/threats", "/activities"]},
-    "api_tokens": {"endpoint": "/api-tokens", "params": None, "alt_endpoints": ["/users/api-token-details"]}
+    "api_tokens": {"endpoint": "/api-tokens", "params": None, "alt_endpoints": ["/users/api-token-details", "/system/api-tokens", "/rbac/api-tokens"]}
 }
 
 # === HELPER FUNCTIONS ===
@@ -171,6 +183,22 @@ def fetch_with_retry(endpoint, params=None, alt_endpoints=None):
                 logger.warning(f"Alternate endpoint {alt_endpoint} also failed: {e}")
                 continue
     
+    # If all alternate endpoints failed and we have fallback URLs, try the primary endpoint with each fallback URL
+    if primary_failed and 'FALLBACK_URLS' in globals() and FALLBACK_URLS:
+        logger.info(f"Trying fallback API versions")
+        for fallback_url in FALLBACK_URLS:
+            fallback_full_url = f"{fallback_url}{endpoint}"
+            logger.info(f"Trying fallback URL: {fallback_full_url}")
+            try:
+                response = requests.get(fallback_full_url, headers=HEADERS, params=params, timeout=TIMEOUT)
+                response.raise_for_status()
+                data = response.json().get("data", [])
+                logger.info(f"Successfully fetched {len(data)} records from fallback URL {fallback_full_url}")
+                return data
+            except Exception as e:
+                logger.warning(f"Fallback URL {fallback_full_url} also failed: {e}")
+                continue
+    
     return []  # Return empty list if all attempts fail
 
 def create_dataframe(data, name):
@@ -182,12 +210,24 @@ def create_dataframe(data, name):
         
         # Special handling for the sites data which may have nested structures
         if name == "sites":
-            # First attempt to normalize nested data
             try:
+                # First check if the data is a list of objects
+                if not isinstance(data, list):
+                    logger.warning(f"Expected list for {name} but got {type(data)}. Converting to list.")
+                    if isinstance(data, dict):
+                        data = [data]
+                    else:
+                        # If it's a string or other type, wrap in a list with a single dict
+                        data = [{"data": data}]
+                
                 # Clean and normalize the data before creating DataFrame
-                # This helps with mixed dict/non-Series data
                 flat_data = []
                 for item in data:
+                    # Skip if not a dict
+                    if not isinstance(item, dict):
+                        logger.warning(f"Skipping non-dict item in {name}: {type(item)}")
+                        continue
+                        
                     # Create a flattened copy of each item
                     flat_item = {}
                     for key, value in item.items():
@@ -199,20 +239,52 @@ def create_dataframe(data, name):
                             flat_item[key] = value
                     flat_data.append(flat_item)
                 
-                df = pd.DataFrame(flat_data)
-                logger.info(f"Created flattened DataFrame for {name} with {len(df)} rows")
-                return df
+                if flat_data:
+                    df = pd.DataFrame(flat_data)
+                    logger.info(f"Created flattened DataFrame for {name} with {len(df)} rows")
+                    return df
+                else:
+                    # If no valid items were found, fall back to json_normalize
+                    logger.warning(f"No valid items found for {name} using flattening approach. Trying normalization.")
+                    raise ValueError("No valid items found")
+                    
             except Exception as inner_e:
                 logger.warning(f"Flattening approach failed for {name}: {inner_e}. Trying alternative approach.")
                 # Fall back to pandas normalization
+                try:
+                    df = pd.json_normalize(data)
+                    logger.info(f"Created normalized DataFrame for {name} with {len(df)} rows")
+                    return df
+                except Exception as norm_e:
+                    logger.warning(f"Normalization failed for {name}: {norm_e}. Trying simple approach.")
+                    # If normalization fails, try simple approach
+                    if isinstance(data, list) and all(isinstance(item, str) for item in data):
+                        df = pd.DataFrame({"name": data})
+                        logger.info(f"Created simple DataFrame for {name} with {len(df)} rows")
+                        return df
+                        df = pd.DataFrame({"name": data})
+                        logger.info(f"Created simple DataFrame for {name} with {len(df)} rows")
+                        return df
+                    else:
+                        # Last resort - try converting to strings
+                        df = pd.DataFrame([{"data": str(d)} for d in data])
+                        logger.info(f"Created fallback DataFrame for {name} with {len(df)} rows")
+                        return df
+        
+        # Default approach for other endpoints
+        try:
+            df = pd.DataFrame(data)
+            logger.info(f"Created DataFrame for {name} with {len(df)} rows")
+            return df
+        except Exception as df_e:
+            logger.warning(f"Standard DataFrame creation failed for {name}: {df_e}. Trying normalization.")
+            try:
                 df = pd.json_normalize(data)
                 logger.info(f"Created normalized DataFrame for {name} with {len(df)} rows")
                 return df
-        
-        # Default approach for other endpoints
-        df = pd.DataFrame(data)
-        logger.info(f"Created DataFrame for {name} with {len(df)} rows")
-        return df
+            except Exception as norm_e:
+                logger.warning(f"All DataFrame creation methods failed for {name}. Creating empty DataFrame.")
+                return pd.DataFrame()
     except Exception as e:
         logger.error(f"Error creating DataFrame for {name}: {e}")
         return pd.DataFrame()
@@ -292,4 +364,4 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())# Trigger workflow run
+    sys.exit(main())
