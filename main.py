@@ -10,7 +10,13 @@ from datetime import datetime
 from requests.exceptions import RequestException, HTTPError, Timeout, ConnectionError
 
 try:
-    from dotenv import load_dotenv
+    from        # Fetch data from each endpoint
+        for name, config in selected_endpoints.items():
+            logger.info(f"Processing {name}...")
+            alt_endpoints = config.get("alt_endpoints", None)
+            data = fetch_with_retry(config["endpoint"], config["params"], alt_endpoints)
+            collection_status[name] = len(data) > 0
+            dataframes[name] = create_dataframe(data, name)v import load_dotenv
     # Load environment variables from .env file if it exists
     load_dotenv()
 except ImportError:
@@ -37,8 +43,12 @@ args = parse_args()
 # - API_TOKEN environment variable (for local development)
 # - SENTINEL_API_TOKEN environment variable (for GitHub/Codespaces)
 API_TOKEN = os.getenv("API_TOKEN") or os.getenv("SENTINEL_API_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "https://usea1-012.sentinelone.net/web/api/v2.1")
-OUTPUT_DIR = args.output or os.getenv("OUTPUT_DIR", "sentinelone_data")
+if API_TOKEN:
+    # Strip any whitespace or newline characters that might be in the token
+    API_TOKEN = API_TOKEN.strip()
+
+# Get output dir and log level
+OUTPUT_DIR = args.output or os.getenv("OUTPUT_DIR", "data_output")
 LOG_LEVEL = args.log_level or os.getenv("LOG_LEVEL", "INFO")
 
 # API request settings
@@ -74,24 +84,35 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+# Determine BASE_URL with flexibility
+BASE_URL = os.getenv("BASE_URL")
+if not BASE_URL:
+    # Default to usea1-012, but allow overriding
+    region = os.getenv("SENTINEL_REGION", "usea1-012")
+    api_version = os.getenv("API_VERSION", "v2.1")
+    BASE_URL = f"https://{region}.sentinelone.net/web/api/{api_version}"
+    logger.info(f"Using auto-configured BASE_URL: {BASE_URL}")
+
 # === API ENDPOINTS ===
 # Dictionary of endpoints to fetch
 ENDPOINTS = {
     "sites": {"endpoint": "/sites", "params": None},
-    "policies": {"endpoint": "/policies", "params": None},
+    "policies": {"endpoint": "/policies", "params": None, "alt_endpoints": ["/endpoint-policies"]},
     "exclusions": {"endpoint": "/exclusions", "params": None},
-    "deployments": {"endpoint": "/deployment-packs", "params": None},
+    "deployments": {"endpoint": "/deployment-packs", "params": None, "alt_endpoints": ["/install-packages", "/installer-packages"]},
     "agents": {"endpoint": "/agents", "params": {"limit": 1000}},
-    "rules": {"endpoint": "/rules", "params": None},
-    "alerts": {"endpoint": "/alerts", "params": {"limit": 100}},
-    "api_tokens": {"endpoint": "/api-tokens", "params": None}
+    "rules": {"endpoint": "/rules", "params": None, "alt_endpoints": ["/firewall/rules", "/network/rules"]},
+    "alerts": {"endpoint": "/alerts", "params": {"limit": 100}, "alt_endpoints": ["/threats", "/activities"]},
+    "api_tokens": {"endpoint": "/api-tokens", "params": None, "alt_endpoints": ["/users/api-token-details"]}
 }
 
 # === HELPER FUNCTIONS ===
-def fetch_with_retry(endpoint, params=None):
+def fetch_with_retry(endpoint, params=None, alt_endpoints=None):
     """Fetch data from API with retry logic"""
+    # Try primary endpoint first
     url = f"{BASE_URL}{endpoint}"
     attempts = 0
+    primary_failed = False
     
     while attempts < MAX_RETRIES:
         try:
@@ -118,6 +139,12 @@ def fetch_with_retry(endpoint, params=None):
             elif response.status_code == 429:
                 logger.error("Rate limit exceeded. Retrying after delay.")
                 # Continue to retry logic for rate limits
+            elif response.status_code == 404 and alt_endpoints and attempts == MAX_RETRIES - 1:
+                # If primary endpoint is 404 and we've tried enough times, mark it as failed
+                # We'll try alternate endpoints after
+                primary_failed = True
+                logger.warning(f"Endpoint {endpoint} not found (404). Will try alternate endpoints.")
+                break
             else:
                 logger.error(f"HTTP error {response.status_code}. Retrying...")
         except (ConnectionError, Timeout) as err:
@@ -134,7 +161,22 @@ def fetch_with_retry(endpoint, params=None):
             time.sleep(wait_time)
         else:
             logger.error(f"All {MAX_RETRIES} attempts failed for {endpoint}")
-            
+    
+    # If primary endpoint failed with 404 and we have alternates, try those
+    if primary_failed and alt_endpoints:
+        for alt_endpoint in alt_endpoints:
+            logger.info(f"Trying alternate endpoint: {alt_endpoint}")
+            alt_url = f"{BASE_URL}{alt_endpoint}"
+            try:
+                response = requests.get(alt_url, headers=HEADERS, params=params, timeout=TIMEOUT)
+                response.raise_for_status()
+                data = response.json().get("data", [])
+                logger.info(f"Successfully fetched {len(data)} records from alternate endpoint {alt_endpoint}")
+                return data
+            except Exception as e:
+                logger.warning(f"Alternate endpoint {alt_endpoint} also failed: {e}")
+                continue
+    
     return []  # Return empty list if all attempts fail
 
 def create_dataframe(data, name):
@@ -144,6 +186,36 @@ def create_dataframe(data, name):
             logger.warning(f"No data available for {name}")
             return pd.DataFrame()
         
+        # Special handling for the sites data which may have nested structures
+        if name == "sites":
+            # First attempt to normalize nested data
+            try:
+                # Clean and normalize the data before creating DataFrame
+                # This helps with mixed dict/non-Series data
+                flat_data = []
+                for item in data:
+                    # Create a flattened copy of each item
+                    flat_item = {}
+                    for key, value in item.items():
+                        if isinstance(value, dict):
+                            # Flatten nested dict with prefixed keys
+                            for sub_key, sub_value in value.items():
+                                flat_item[f"{key}_{sub_key}"] = sub_value
+                        else:
+                            flat_item[key] = value
+                    flat_data.append(flat_item)
+                
+                df = pd.DataFrame(flat_data)
+                logger.info(f"Created flattened DataFrame for {name} with {len(df)} rows")
+                return df
+            except Exception as inner_e:
+                logger.warning(f"Flattening approach failed for {name}: {inner_e}. Trying alternative approach.")
+                # Fall back to pandas normalization
+                df = pd.json_normalize(data)
+                logger.info(f"Created normalized DataFrame for {name} with {len(df)} rows")
+                return df
+        
+        # Default approach for other endpoints
         df = pd.DataFrame(data)
         logger.info(f"Created DataFrame for {name} with {len(df)} rows")
         return df
@@ -200,7 +272,7 @@ def main():
         # Fetch data from each endpoint
         for name, config in selected_endpoints.items():
             logger.info(f"Processing {name}...")
-            data = fetch_with_retry(config["endpoint"], config["params"])
+            data = fetch_with_retry(config["endpoint"], config["params"], config.get("alt_endpoints"))
             collection_status[name] = len(data) > 0
             dataframes[name] = create_dataframe(data, name)
         
