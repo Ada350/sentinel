@@ -18,7 +18,7 @@ except ImportError:
     pass
 
 # === CONFIGURATION ===
-# Parse command line arguments
+# Parse command lines arguments
 def parse_args():
     parser = argparse.ArgumentParser(description="SentinelOne API Data Collector")
     parser.add_argument("--output", type=str, 
