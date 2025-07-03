@@ -1,0 +1,72 @@
+name: SentinelOne Data Collection
+
+on:
+  schedule:
+    # Run daily at 1 AM UTC
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    # Allow manual triggering with optional parameters
+    inputs:
+      specific_endpoints:
+        description: 'Specific endpoints to collect (comma-separated, leave empty for all)'
+        required: false
+      log_level:
+        description: 'Log level (DEBUG, INFO, WARNING, ERROR)'
+        required: false
+        default: 'INFO'
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Run data collection
+        env:
+          API_TOKEN: ${{ secrets.SENTINEL_API_TOKEN }}
+          LOG_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
+          OUTPUT_DIR: 'data_output'
+        run: |
+          if [ -n "${{ github.event.inputs.specific_endpoints }}" ]; then
+            # Convert comma-separated endpoints to space-separated for the script
+            ENDPOINTS=$(echo "${{ github.event.inputs.specific_endpoints }}" | tr ',' ' ')
+            python main.py --endpoints $ENDPOINTS
+          else
+            python main.py
+          fi
+        
+      - name: Upload CSV data as artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: sentinelone-data-${{ github.run_id }}
+          path: data_output/*.csv
+          retention-days: 7
+          
+      - name: Upload logs as artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: sentinelone-logs-${{ github.run_id }}
+          path: data_output/logs/*.log
+          retention-days: 3
+          
+      - name: Summarize collection results
+        run: |
+          echo "## SentinelOne Data Collection Results" >> $GITHUB_STEP_SUMMARY
+          echo "Collection completed at $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### CSV Files Generated" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -lh data_output/*.csv 2>/dev/null | awk '{print $5 "\t" $9}' >> $GITHUB_STEP_SUMMARY || echo "No CSV files generated" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

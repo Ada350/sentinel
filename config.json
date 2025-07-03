@@ -1,0 +1,45 @@
+{
+  "api_token": "",
+  "base_url": "https://usea1-012.sentinelone.net/web/api/v2.1",
+  "request_delay": 0.5,
+  "timeout": 30,
+  "max_retries": 3,
+  "endpoints": {
+    "sites": {
+      "endpoint": "/sites",
+      "params": null
+    },
+    "policies": {
+      "endpoint": "/policies",
+      "params": null
+    },
+    "exclusions": {
+      "endpoint": "/exclusions",
+      "params": null
+    },
+    "deployments": {
+      "endpoint": "/deployment-packs",
+      "params": null
+    },
+    "agents": {
+      "endpoint": "/agents",
+      "params": {
+        "limit": 1000
+      }
+    },
+    "rules": {
+      "endpoint": "/rules",
+      "params": null
+    },
+    "alerts": {
+      "endpoint": "/alerts",
+      "params": {
+        "limit": 100
+      }
+    },
+    "api_tokens": {
+      "endpoint": "/api-tokens",
+      "params": null
+    }
+  }
+}
